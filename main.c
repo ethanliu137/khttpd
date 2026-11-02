@@ -1,12 +1,16 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/dcache.h>
+#include <linux/fs_struct.h>
 #include <linux/jiffies.h>
 #include <linux/kthread.h>
 #include <linux/mempool.h>
 #include <linux/sched/signal.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/tcp.h>
 #include <linux/version.h>
+#include <linux/workqueue.h>
 #include <net/sock.h>
 
 #include "http_server.h"
@@ -15,6 +19,7 @@
 #define DEFAULT_BACKLOG 100
 #define POOL_MIN_NR 4
 #define ACCEPT_TIMEOUT_MS 5000
+#define PATH_SIZE 100
 
 mempool_t *http_buf_pool;
 
@@ -22,6 +27,10 @@ static ushort port = DEFAULT_PORT;
 module_param(port, ushort, S_IRUGO);
 static ushort backlog = DEFAULT_BACKLOG;
 module_param(backlog, ushort, S_IRUGO);
+static char WWWROOT[PATH_SIZE];
+struct workqueue_struct *khttpd_wq;
+struct httpd_service daemon_list;
+module_param_string(WWWROOT, WWWROOT, PATH_SIZE, 0);  // 註冊模組參數
 
 static struct socket *listen_socket;
 static struct http_server_param param;
@@ -170,23 +179,56 @@ static int __init khttpd_init(void)
 {
     int err;
 
-    if (!(http_buf_pool = mempool_create(POOL_MIN_NR, http_buf_alloc,
-                                         http_buf_free, NULL))) {
+    // 設定網站 root：沒有指定 WWWROOT 就用 insmod 時所在的目錄
+    if (!*WWWROOT) {
+        struct path pwd;
+        char *cwd;
+        char current_path[PATH_SIZE] = {0};
+
+        pwd = current->fs->pwd;
+        path_get(&pwd);
+        cwd = d_path(&pwd, current_path, sizeof(current_path));
+        if (!IS_ERR(cwd))
+            strscpy(WWWROOT, cwd, PATH_SIZE);
+        else
+            WWWROOT[0] = '/';
+        path_put(&pwd);
+    }
+    daemon_list.dir_path = WWWROOT;  // 把路徑存到 list 中
+    pr_info("WWWROOT = %s\n", WWWROOT);
+
+    // 建立 workqueue，使用 CMWQ
+    khttpd_wq = alloc_workqueue(KBUILD_MODNAME, 0, 0);
+    if (!khttpd_wq) {
         pr_err("failed to create mempool\n");
         return -ENOMEM;
     }
+
+    // 建立 memory pool
+    http_buf_pool =
+        mempool_create(POOL_MIN_NR, http_buf_alloc, http_buf_free, NULL);
+    if (!http_buf_pool) {
+        pr_err("failed to create mempool\n");
+        err = -ENOMEM;
+        goto err_destroy_wq;
+    }
+
+    // 開監聽的 socket
     err = open_listen_socket(port, backlog, &listen_socket);
     if (err < 0) {
         pr_err("can't open listen socket\n");
         goto err_destroy_pool;
     }
     param.listen_socket = listen_socket;
+
+    // 啟動 daemon，開始接收連線
     http_server = kthread_run(http_server_daemon, &param, KBUILD_MODNAME);
     if (IS_ERR(http_server)) {
         pr_err("can't start http server daemon\n");
         err = PTR_ERR(http_server);
         goto err_close_socket;
     }
+
     return 0;
 
 err_close_socket:
@@ -194,6 +236,8 @@ err_close_socket:
 err_destroy_pool:
     mempool_destroy(http_buf_pool);
     http_buf_pool = NULL;
+err_destroy_wq:
+    destroy_workqueue(khttpd_wq);
     return err;
 }
 
@@ -203,6 +247,7 @@ static void __exit khttpd_exit(void)
     /* Returns only after the daemon has drained every worker */
     kthread_stop(http_server);
     close_listen_socket(listen_socket);
+    destroy_workqueue(khttpd_wq);
     mempool_destroy(http_buf_pool);
     pr_info("module unloaded\n");
 }
